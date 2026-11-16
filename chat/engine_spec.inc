@@ -110,8 +110,8 @@ int spec_init(Engine* e, const char* dir) {
     if (!s->k_emb || !s->k_draft || !s->k_accept || !s->k_convv || !s->k_commit || !s->k_deltav || !s->k_copyg ||
         !s->k_rmsg || !e->tq || !e->pf || s->nd > e->vocab || s->nd % 128)
         return -1;
-    s->theta = 0.5f;   // the defaults: theta 0.5, K 2
-    s->kmax = 2;
+    s->theta = 0.5f;   // the defaults: theta 0.5, K 3 on PS4 Pro (Neo), K 2 on Base PS4
+    s->kmax = e->neo ? 3 : 2;
     {   // /data/garlic_spec.txt: "<kmax> <theta>" (kmax 0 = off)
         char* f = (char*)read_file("/data/garlic_spec.txt", &sz);
         if (f && sz) {
@@ -142,7 +142,7 @@ static uint64_t spec_layout(Engine* e, uint64_t base) {
     TAKE(kc, 4 * kb);
     s->vc = s->kc + kb;
     s->tq_split = 2 * kb;
-    uint64_t H = e->hidden, R = SPEC_ROWS;
+    uint64_t H = e->hidden, R = e->pf_rows;
     uint32_t nl = 0, ld = 0, npad = e->t[e->head_idx].rows;
     for (uint32_t i = 0; i < e->n_layers; i++)
         if (!(e->full_mask >> i & 1)) nl++, ld = e->t[e->layer_base[i] + 2].rows;

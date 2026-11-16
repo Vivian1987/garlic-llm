@@ -324,6 +324,7 @@ static char think_text[32768];
 static size_t think_len;
 static uint32_t hist_ids[MAX_REPLY + 16];   // the turn as the model keeps it: an empty <think></think>, the answer
 static int hist_n, hist_done;
+static int api_snap_n;                      // tokens in the API's saved prefix snapshot (eng.asr.ws_begin), 0 = none
 static void start_turn(const char* user_text);
 
 static void toast(StrId id) {
@@ -540,6 +541,7 @@ static void think_toggle(void) {
 static int think_save(void) {
     uint64_t need = engine_state_size(&eng);
     if (!eng.asr.ws_end || eng.asr.ws_end - eng.asr.ws_begin < need) return 0;
+    api_snap_n = 0;
     double t0 = now();
     if (engine_state_copy(&eng, eng.asr.ws_begin, 1)) {
         say("thinking: state copy failed (%s): the reasoning stays in the history", eng.error);
@@ -684,6 +686,7 @@ static void system_ahead(int tokens) {
     }
     if (sys_pre == 0) {
         sys_n = system_ids(sys_ids, 1024);
+        api_snap_n = 0;
         engine_reset(&eng);
     }
     int k = sys_n - sys_pre < tokens ? sys_n - sys_pre : tokens;
@@ -704,6 +707,7 @@ static void start_turn(const char* user_text) {
     int n = 0, max = 8192, think = think_on && !in_voice_mode && eng.qwen35;
     think_t_ask = now();
     sys_pre = 0;   // (a system prompt half read ahead is read again below)
+    api_snap_n = 0;
     if (pos == 0) {
         engine_reset(&eng);   // a new conversation: clear the Gated DeltaNet states
         n = system_ids(ids, max);
@@ -1130,6 +1134,7 @@ static void asr_wait(void);
 
 static int voice_to_text(uint32_t button, DrawUnder under, char* text, int max) {
     text[0] = 0;
+    api_snap_n = 0;
     asr_wait();   // (after a Python program the dictation weights are read back first)
     if (!eng.asr.ready) {
         toast(S_ASR_OFF);
@@ -1676,6 +1681,7 @@ static void spec_lend(void) {
 
 static void voice_mode(void) {
     in_voice_mode = 1;
+    api_snap_n = 0;
 #ifdef GARLIC_SPEC
     if (spec_lent) {   // the MTP head had T3's weights memory: T3 reads its weights again (~3.5 s)
         double t0 = now();

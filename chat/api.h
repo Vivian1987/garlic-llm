@@ -28,6 +28,8 @@ ApiJob* api_take(void);
 void api_done(ApiJob* job);
 // Writes all n bytes to fd. Returns 0, or -1 if the client went away.
 int api_send(int fd, const char* p, size_t n);
+// Non-blocking check: returns 1 if the client closed fd (EOF), 0 otherwise.
+int api_client_gone(int fd);
 // The model's name as the API reports it.
 void api_set_model(const char* name);
 const char* api_model(void);

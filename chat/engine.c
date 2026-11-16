@@ -25,7 +25,10 @@
 #define SH_PGM_RSRC1 0x212
 #define SH_RESOURCE_LIMITS 0x215
 #define SH_STATIC_THREAD_MGMT_SE0 0x216
+#define SH_STATIC_THREAD_MGMT_SE2 0x219
 #define SH_TMPRING_SIZE 0x218
+
+int sceKernelIsNeoMode(void);
 #define SH_USER_DATA_0 0x240
 #define EV_CS_PARTIAL_FLUSH (7 | (4 << 8))
 #define EV_BOTTOM_OF_PIPE_TS (0x28 | (5 << 8))
@@ -71,16 +74,21 @@ static void fail(Engine* e, const char* fmt, ...) {
     sceKernelDebugOutText(0, line);
 }
 
-// Where a weights file is: inside the package (/app0/models, the all-in-one PKG) or, with an app-only package, at the
-// path its index names (in /data). The first one that exists; path (129 bytes or more) is rewritten in place.
+// Where a weights file is: in /data/garlic-llm/models, in /data (the path its index names), or inside the package
+// (/app0/models, the all-in-one PKG). The first one that exists; path (129 bytes or more) is rewritten in place.
 static void weights_locate(char* path) {
     const char* base = strrchr(path, '/');
-    char in_pkg[129];
-    snprintf(in_pkg, sizeof(in_pkg), "/app0/models/%s", base ? base + 1 : path);
-    int f = open(in_pkg, O_RDONLY);
-    if (f >= 0) {
-        close(f);
-        strcpy(path, in_pkg);
+    const char* name = base ? base + 1 : path;
+    static const char* dirs[] = {"/data/garlic-llm/models", "/data", "/app0/models"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char cand[129];
+        snprintf(cand, sizeof(cand), "%s/%s", dirs[i], name);
+        int f = open(cand, O_RDONLY);
+        if (f >= 0) {
+            close(f);
+            strcpy(path, cand);
+            break;
+        }
     }
     say("weights: %s", path);
 }
@@ -118,8 +126,12 @@ int eng_margin_mb = 64;
 static int reserve_garlic(Engine* e) {
     // as much of the app's direct memory as is still free (the framebuffers took theirs), 32 MiB at a time
     // (the first size that works, less eng_margin_mb left for the system dialogs: 64 MiB, or 32 when main.c took
-    // 32 of them for the screen copies, which leaves the same block for the model)
-    for (uint64_t m = (sceKernelGetDirectMemorySize() >> 20) & ~31ull; m >= 1024; m -= 32) {
+    // 32 of them for the screen copies, which leaves the same block for the model). Cap at 4608 MiB so on PS4 Pro
+    // in Neo mode the extra 512 MiB of RAM stays free for flexible memory (Parakeet ASR, Python, network).
+    uint64_t top = (sceKernelGetDirectMemorySize() >> 20) & ~31ull;
+    uint64_t cap = e->neo ? 4736 : 4608;
+    if (top > cap) top = cap;
+    for (uint64_t m = top; m >= 1024; m -= 32) {
         uint64_t size = m << 20;
         off_t off = 0;
         void* addr = NULL;
@@ -331,6 +343,8 @@ static int load_index(Engine* e, const char* dir) {
 int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     memset(e, 0, sizeof(*e));
     e->tsc_freq = sceKernelGetTscFrequency();
+    e->neo = sceKernelIsNeoMode() == 1;
+    e->pf_rows = e->neo ? 64 : PF_ROWS;
     if (load_index(e, dir)) return -1;
     if (reserve_garlic(e)) {
         fail(e, "could not reserve GPU memory");
@@ -466,7 +480,7 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     e->bsum = gpu_alloc(e, (uint64_t)(e->inter > e->hidden ? e->inter : e->hidden) / 32 * 4 + 4096);
     uint32_t stage_rows = STEPS_PER_SUBMIT;
     if (e->pf && e->cpu_embed)
-        stage_rows = 2 * PF_ROWS > STEPS_PER_SUBMIT ? 2 * PF_ROWS : STEPS_PER_SUBMIT;   // two batches of the prompt
+        stage_rows = 2 * e->pf_rows > STEPS_PER_SUBMIT ? 2 * e->pf_rows : STEPS_PER_SUBMIT;   // two batches of the prompt
     e->staging = gpu_alloc(e, (uint64_t)stage_rows * e->hidden * 4);
     // q | k | v (| output gate, Qwen3.5); the DeltaNet input projection: q | k | v | z | b | a
     e->qkv = gpu_alloc(e, (uint64_t)(e->n_heads + 2 * e->n_kv + (e->qwen35 ? e->n_heads : 0)) * e->head_dim * 4);
@@ -475,22 +489,22 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
     e->gu = gpu_alloc(e, 2 * e->inter * 4);
     e->down = gpu_alloc(e, e->hidden * 4);
     e->logits = gpu_alloc(e, (uint64_t)(e->head_idx ? e->t[e->head_idx].rows : e->vocab) * 4);
-    if (e->swar) {   // int8 activations for up to PF_ROWS rows of the widest input, and the split-K partial sums
+    if (e->swar) {   // int8 activations for up to e->pf_rows rows of the widest input, and the split-K partial sums
         uint32_t mc = 0, mr = 0;
         for (uint32_t i = 0; i < e->n_tensors; i++)
             if (e->t[i].fmt == 6 || e->t[i].fmt == 8) {
                 if (e->t[i].cols > mc) mc = e->t[i].cols;
                 if (e->t[i].rows > mr && e->t[i].rows <= SWAR_SPLIT_ROWS) mr = e->t[i].rows;
             }
-        e->x8 = gpu_alloc(e, (uint64_t)PF_ROWS * mc * 4);
-        e->dx8 = gpu_alloc(e, (uint64_t)PF_ROWS * mc / 32 * 4);
-        e->init8 = gpu_alloc(e, (uint64_t)PF_ROWS * mc / 32 * 4);
+        e->x8 = gpu_alloc(e, (uint64_t)e->pf_rows * mc * 4);
+        e->dx8 = gpu_alloc(e, (uint64_t)e->pf_rows * mc / 32 * 4);
+        e->init8 = gpu_alloc(e, (uint64_t)e->pf_rows * mc / 32 * 4);
         e->yp_rows = mr;
         e->yp = gpu_alloc(e, 16ull * mr * 4);
     }
     e->last = gpu_alloc(e, 256);
     e->history = gpu_alloc(e, 4096 * 4);
-    // the batched prompt: q4i / q3i matrices (rows in tiles of 64), and PF_ROWS rows of each buffer (5.8 MiB for the 9B)
+    // the batched prompt: q4i / q3i matrices (rows in tiles of 64), and e->pf_rows rows of each buffer
     uint64_t pf_wa = 0, pf_wh = 0;
     for (uint32_t i = 0; e->pf && i < e->n_layers; i++) {
         uint32_t b = e->layer_base[i], full = e->full_mask >> i & 1;
@@ -504,12 +518,12 @@ int engine_init(Engine* e, const char* dir, ProgressFn progress, void* user) {
             if ((j & 1) && t->cols > pf_wh) pf_wh = t->cols;    // o / out projection, down: columns in
         }
     }
-    pf_a_floats = (uint64_t)PF_ROWS * pf_wa, pf_h_floats = (uint64_t)PF_ROWS * pf_wh;
+    pf_a_floats = (uint64_t)e->pf_rows * pf_wa, pf_h_floats = (uint64_t)e->pf_rows * pf_wh;
     if (e->pf) {
-        e->pf_x = gpu_alloc(e, (uint64_t)PF_ROWS * e->hidden * 4);
-        e->pf_xn = gpu_alloc(e, (uint64_t)PF_ROWS * e->hidden * 4);
-        e->pf_a = gpu_alloc(e, PF_ROWS * pf_wa * 4);
-        e->pf_h = gpu_alloc(e, PF_ROWS * pf_wh * 4);
+        e->pf_x = gpu_alloc(e, (uint64_t)e->pf_rows * e->hidden * 4);
+        e->pf_xn = gpu_alloc(e, (uint64_t)e->pf_rows * e->hidden * 4);
+        e->pf_a = gpu_alloc(e, e->pf_rows * pf_wa * 4);
+        e->pf_h = gpu_alloc(e, e->pf_rows * pf_wh * 4);
         if (!e->pf_h) e->pf = 0;
     }
     e->model = gpu_alloc(e, e->weights_size);
@@ -1044,6 +1058,7 @@ static void begin(Engine* e) {
     uint32_t all[2] = {0xFFFFFFFF, 0xFFFFFFFF}, zero3[3] = {0, 0, 0};
     set_sh1(e, SH_RESOURCE_LIMITS, 0);
     set_sh(e, SH_STATIC_THREAD_MGMT_SE0, 2, all);
+    if (e->neo) set_sh(e, SH_STATIC_THREAD_MGMT_SE2, 2, all);
     set_sh1(e, SH_TMPRING_SIZE, 0);
     set_sh(e, SH_START_X, 3, zero3);
     acquire(e, COHER_L2_TCL1_KCACHE);   // see COHER_L2_TCL1_KCACHE
@@ -1183,7 +1198,7 @@ int engine_run(Engine* e, const uint32_t* tokens, int n, int pos0, float tempera
         // is of 8 tokens, so that even a short prompt (voice mode: 20-30 tokens) has most of its rows read meanwhile;
         // with the r8 products a batch of 8 costs about the same per token as one of 32.
 #define PF_FIRST 8
-#define PF_SIZE(i) ((i) == 0 && n > PF_FIRST ? PF_FIRST : n - (i) < PF_ROWS ? n - (i) : PF_ROWS)
+#define PF_SIZE(i) ((i) == 0 && n > PF_FIRST ? PF_FIRST : n - (i) < (int)e->pf_rows ? n - (i) : (int)e->pf_rows)
         uint64_t rowb = (uint64_t)e->hidden * 4;
         for (int i = 0; e->cpu_embed && i < PF_SIZE(0); i++)
             if (fetch_row(e, tokens[i], (float*)(uintptr_t)(e->staging + (uint64_t)i * rowb))) return -1;
@@ -1191,13 +1206,13 @@ int engine_run(Engine* e, const uint32_t* tokens, int n, int pos0, float tempera
             k = PF_SIZE(i0);
             int i1 = i0 + k, k1 = i1 < n ? PF_SIZE(i1) : 0;
             begin(e);
-            prefill(e, e->staging + (uint64_t)c * PF_ROWS * rowb, tokens + i0, (uint32_t)k, (uint32_t)(pos0 + i0),
+            prefill(e, e->staging + (uint64_t)c * e->pf_rows * rowb, tokens + i0, (uint32_t)k, (uint32_t)(pos0 + i0),
                     i0 + k == n, inv_temp, seed);
 #ifdef GARLIC_SPEC
-            if (spec_active(e)) spec_prefill(e, e->staging + (uint64_t)c * PF_ROWS * rowb, (uint32_t)k, (uint32_t)(pos0 + i0));
+            if (spec_active(e)) spec_prefill(e, e->staging + (uint64_t)c * e->pf_rows * rowb, (uint32_t)k, (uint32_t)(pos0 + i0));
 #endif
             if (submit_go(e)) return -1;
-            uint64_t next_stage = e->staging + (uint64_t)(c ^ 1) * PF_ROWS * rowb;
+            uint64_t next_stage = e->staging + (uint64_t)(c ^ 1) * e->pf_rows * rowb;
             for (int i = 0; e->cpu_embed && i < k1; i++)
                 if (fetch_row(e, tokens[i1 + i], (float*)(uintptr_t)(next_stage + (uint64_t)i * rowb))) {
                     submit_wait(e);
@@ -1251,14 +1266,14 @@ static void mm_tune(Engine* e) {
             if (seen) continue;
             int q3 = t->fmt == 5;
             float* X = (float*)(uintptr_t)e->pf_h;
-            for (uint32_t k = 0; k < PF_ROWS * t->cols; k++) X[k] = (float)(((k * 2654435761u) >> 16) & 1023) / 512.0f - 1.0f;
+            for (uint32_t k = 0; k < e->pf_rows * t->cols; k++) X[k] = (float)(((k * 2654435761u) >> 16) & 1023) / 512.0f - 1.0f;
             __asm__ volatile("sfence" ::: "memory");
             char line[400];
             int o = snprintf(line, sizeof(line), "mm tune %ux%u %s:", t->rows, t->cols, q3 ? "q3i" : "q4i");
             int ent = e->pf_nmm++;
             e->pf_mm[ent].fmt = t->fmt, e->pf_mm[ent].rows = t->rows, e->pf_mm[ent].cols = t->cols;
             for (int s = 0; s < 2; s++) {
-                uint32_t n = s ? 16 : PF_ROWS, nsamp = 0;
+                uint32_t n = s ? 16 : e->pf_rows, nsamp = 0;
                 static float ref[2048];
                 volatile float* Y = (volatile float*)(uintptr_t)e->pf_a;
                 uint64_t ny = (uint64_t)n * t->rows, stride = ny / 2048 + 1;

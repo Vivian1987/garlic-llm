@@ -142,11 +142,160 @@ static void test_writers(void) {
     sb_free(&s);
 }
 
+static void test_tools(void) {
+    JNode pool[API_MAX_NODES];
+    ChatRequest req;
+    const char* err = NULL;
+    const char* body =
+        "{"
+        "\"messages\":["
+        "{\"role\":\"system\",\"content\":\"Be concise.\"},"
+        "{\"role\":\"user\",\"content\":\"Search for PS4 homebrew\"},"
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+        "{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"PS4 homebrew\\\",\\\"max_results\\\":3}\"}}"
+        "]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"Result 1: Garlic LLM\"}"
+        "],"
+        "\"tools\":["
+        "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"max_results\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}}"
+        "],"
+        "\"tool_choice\":\"required\""
+        "}";
+    CHECK(api_chat_parse(body, strlen(body), pool, API_MAX_NODES, &req, &err) == 0);
+    CHECK(req.n_tools == 1 && req.tools >= 0 && req.tool_choice == TOOL_REQUIRED);
+
+    // System prompt with tools
+    Sb sys;
+    sb_init(&sys);
+    api_system_tools(pool, &req, "Be concise.", &sys);
+    CHECK(sys.p && strstr(sys.p, "<tools>\n{\"type\":\"function\",\"function\":{\"name\":\"web_search\"") != NULL);
+    CHECK(strstr(sys.p, "</IMPORTANT>\n\nBe concise.") != NULL);
+    sb_free(&sys);
+
+    // Assistant message with tool_calls -> Qwen3.5 XML format
+    int m = pool[req.messages].first;
+    m = pool[m].next;   // user
+    m = pool[m].next;   // assistant
+    Sb tc_out;
+    sb_init(&tc_out);
+    CHECK(api_assistant_tool_calls(pool, m, &tc_out) == 1);
+    CHECK(tc_out.p && !strcmp(tc_out.p,
+                              "<tool_call>\n<function=web_search>\n"
+                              "<parameter=query>\nPS4 homebrew\n</parameter>\n"
+                              "<parameter=max_results>\n3\n</parameter>\n"
+                              "</function>\n</tool_call>"));
+    sb_free(&tc_out);
+
+    // Parsing Qwen3.5 XML tool call output (with string + integer parameter type coercion from schema)
+    const char* reply =
+        "Let me look that up.\n\n"
+        "<tool_call>\n"
+        "<function=web_search>\n"
+        "<parameter=query>\n"
+        "Garlic LLM PS4\n"
+        "</parameter>\n"
+        "<parameter=max_results>\n"
+        "5\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    ApiToolCall calls[API_MAX_TOOL_CALLS];
+    Sb clean;
+    sb_init(&clean);
+    int n_calls = api_parse_tool_calls(pool, &req, reply, strlen(reply), &clean, calls, API_MAX_TOOL_CALLS);
+    CHECK(n_calls == 1);
+    CHECK(clean.p && !strcmp(clean.p, "Let me look that up."));
+    CHECK(!strcmp(calls[0].id, "call_1"));
+    CHECK(!strcmp(calls[0].name, "web_search"));
+    CHECK(calls[0].arguments.p && !strcmp(calls[0].arguments.p, "{\"query\":\"Garlic LLM PS4\",\"max_results\":5}"));
+
+    // Non-streaming completion writer with tool_calls (content null vs non-null)
+    Sb comp;
+    sb_init(&comp);
+    api_json_completion_tools(&comp, "chatcmpl-9", "Qwen3.5-9B", 1700000000, NULL, 0, calls, n_calls, "tool_calls", 40,
+                              18);
+    CHECK(comp.p && strstr(comp.p, "\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\","
+                                   "\"function\":{\"name\":\"web_search\",\"arguments\":"
+                                   "\"{\\\"query\\\":\\\"Garlic LLM PS4\\\",\\\"max_results\\\":5}\"}}]") != NULL);
+    CHECK(strstr(comp.p, "\"finish_reason\":\"tool_calls\"") != NULL);
+    sb_free(&comp);
+
+    // Streaming chunk writer for tool_calls
+    Sb chunk;
+    sb_init(&chunk);
+    api_json_chunk_tool(&chunk, "chatcmpl-9", "Qwen3.5-9B", 1700000000, 0, &calls[0]);
+    CHECK(chunk.p && strstr(chunk.p, "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\"") != NULL);
+    sb_free(&chunk);
+
+    api_free_tool_calls(calls, n_calls);
+    sb_free(&clean);
+
+    // Parsing JSON-style <tool_call> fallback
+    const char* json_reply = "<tool_call>\n{\"name\":\"web_search\",\"arguments\":{\"query\":\"orbis\"}}\n</tool_call>";
+    sb_init(&clean);
+    n_calls = api_parse_tool_calls(pool, &req, json_reply, strlen(json_reply), &clean, calls, API_MAX_TOOL_CALLS);
+    CHECK(n_calls == 1 && clean.n == 0);
+    CHECK(!strcmp(calls[0].name, "web_search"));
+    CHECK(calls[0].arguments.p && !strcmp(calls[0].arguments.p, "{\"query\":\"orbis\"}"));
+    api_free_tool_calls(calls, n_calls);
+    sb_free(&clean);
+
+    // Named tool_choice
+    const char* named =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"web_search\"}}],"
+        "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"web_search\"}}}";
+    CHECK(api_chat_parse(named, strlen(named), pool, API_MAX_NODES, &req, &err) == 0);
+    CHECK(req.tool_choice == TOOL_NAMED && !strcmp(req.tool_name, "web_search"));
+
+    // Audio modalities + audio options + WAV & base64 writers
+    const char* aud_req =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],"
+        "\"modalities\":[\"text\",\"audio\"],"
+        "\"audio\":{\"format\":\"wav\",\"voice\":\"es\"}}";
+    CHECK(api_chat_parse(aud_req, strlen(aud_req), pool, API_MAX_NODES, &req, &err) == 0);
+    CHECK(req.want_audio == 1 && req.audio_pcm == 0 && !strcmp(req.audio_voice, "es"));
+
+    const char* pcm_req =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],"
+        "\"audio\":{\"format\":\"pcm16\",\"voice\":\"en\"}}";
+    CHECK(api_chat_parse(pcm_req, strlen(pcm_req), pool, API_MAX_NODES, &req, &err) == 0);
+    CHECK(req.want_audio == 1 && req.audio_pcm == 1 && !strcmp(req.audio_voice, "en"));
+
+    int16_t samples[4] = {0, 1000, -1000, 32767};
+    Sb wav;
+    sb_init(&wav);
+    api_wav_from_pcm16(&wav, samples, 4, 24000);
+    CHECK(wav.n == 44 + 8 && !memcmp(wav.p, "RIFF", 4) && !memcmp(wav.p + 8, "WAVEfmt ", 8));
+    Sb aud_comp;
+    sb_init(&aud_comp);
+    api_json_completion_full(&aud_comp, "chatcmpl-a", "Qwen3.5-9B", 1700000000, "Hola", 4, NULL, 0, "audio-1",
+                             (const uint8_t*)wav.p, wav.n, "stop", 5, 2);
+    CHECK(aud_comp.p && strstr(aud_comp.p, "\"audio\":{\"id\":\"audio-1\",\"data\":\"UklGR") != NULL);
+    CHECK(strstr(aud_comp.p, "\"transcript\":\"Hola\"") != NULL);
+    sb_free(&aud_comp);
+    sb_free(&wav);
+
+    // Invalid tool / audio requests
+    const char* bad_tools[] = {
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"tools\":{}}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"tools\":[{}]}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"tool_choice\":\"required\"}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"tools\":[{\"name\":\"f\"}],\"tool_choice\":\"bogus\"}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"audio\":{\"format\":\"mp3\"}}",
+    };
+    for (size_t i = 0; i < sizeof(bad_tools) / sizeof(bad_tools[0]); i++) {
+        CHECK(api_chat_parse(bad_tools[i], strlen(bad_tools[i]), pool, API_MAX_NODES, &req, &err) == -1);
+    }
+}
+
 int main(void) {
     test_http();
     test_json();
     test_chat();
     test_writers();
+    test_tools();
     printf("%d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

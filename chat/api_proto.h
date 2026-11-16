@@ -20,6 +20,9 @@ void sb_add(Sb* s, const char* p, size_t n);
 void sb_str(Sb* s, const char* z);
 void sb_json_str(Sb* s, const char* p, size_t n);   // a JSON string literal, quotes included
 void sb_int(Sb* s, long long v);
+void sb_base64(Sb* out, const uint8_t* data, size_t len);
+// Builds a 24 kHz (or sample_rate) 16-bit mono RIFF WAVE file in out from n_samples 16-bit signed PCM samples.
+void api_wav_from_pcm16(Sb* out, const int16_t* pcm, size_t n_samples, int sample_rate);
 
 // ---- HTTP request ---------------------------------------------------------------------------------------------------
 typedef struct {
@@ -59,6 +62,22 @@ void json_str_sb(const JNode* pool, int node, Sb* out);
 // The text of one chat message: its role (copied into role, NUL-terminated) and its content into out. Content may be
 // a string or an array of parts (their "text" parts are joined). Returns 0, or -1 if the message is malformed.
 int api_message(const JNode* pool, int msg, char* role, size_t rcap, Sb* out);
+// Writes any parsed JSON node back as compact JSON text into out.
+void json_write(const JNode* pool, int node, Sb* out);
+
+// ---- tool calls ---------------------------------------------------------------------------------------------------
+#define API_MAX_NODES 4096
+#define API_MAX_TOOL_CALLS 16
+
+enum { TOOL_NONE = 0, TOOL_AUTO = 1, TOOL_REQUIRED = 2, TOOL_NAMED = 3 };
+
+typedef struct {
+    char id[40];                // e.g. "call_1"
+    char name[64];              // function name
+    Sb arguments;               // JSON object string, e.g. "{\"query\":\"ps4\"}"
+} ApiToolCall;
+
+void api_free_tool_calls(ApiToolCall* calls, int n);
 
 // ---- JSON writers used by the API ------------------------------------------------------------------------------------
 // The JSON of GET /v1/models: one model, the one loaded.
@@ -66,18 +85,38 @@ void api_json_models(Sb* out, const char* model, long long created);
 // A complete chat.completion (non-streaming).
 void api_json_completion(Sb* out, const char* id, const char* model, long long created, const char* text, size_t tlen,
                          const char* finish, int prompt_tokens, int completion_tokens);
+// A complete chat.completion with optional tool_calls and optional synthesized audio.
+void api_json_completion_tools(Sb* out, const char* id, const char* model, long long created, const char* text,
+                               size_t tlen, const ApiToolCall* calls, int n_calls, const char* finish,
+                               int prompt_tokens, int completion_tokens);
+void api_json_completion_full(Sb* out, const char* id, const char* model, long long created, const char* text,
+                              size_t tlen, const ApiToolCall* calls, int n_calls, const char* audio_id,
+                              const uint8_t* audio_data, size_t audio_len, const char* finish, int prompt_tokens,
+                              int completion_tokens);
 // One chat.completion.chunk (streaming). role != NULL: the first chunk, with the role. text may be empty.
 void api_json_chunk(Sb* out, const char* id, const char* model, long long created, const char* role, const char* text,
                     size_t tlen, const char* finish);
+// One streaming chat.completion.chunk carrying a single tool_call delta at index.
+void api_json_chunk_tool(Sb* out, const char* id, const char* model, long long created, int index,
+                         const ApiToolCall* call);
+// One streaming chat.completion.chunk carrying synthesized audio (base64 data + transcript).
+void api_json_chunk_audio(Sb* out, const char* id, const char* model, long long created, const char* audio_id,
+                          const uint8_t* audio_data, size_t audio_len, const char* transcript, size_t tlen);
 // The error object: {"error": {"message", "type", "code"}}.
 void api_json_error(Sb* out, const char* message, const char* type, const char* code);
 
 // ---- chat request -------------------------------------------------------------------------------------------------
-#define API_MAX_NODES 1024
 typedef struct {
     int root;                   // root node (in the pool the caller gives)
     int messages;               // the messages array node (-1 if missing)
     int n_messages;
+    int tools;                  // the tools array node (-1 if missing or empty)
+    int n_tools;
+    int tool_choice;            // TOOL_NONE, TOOL_AUTO, TOOL_REQUIRED, TOOL_NAMED
+    char tool_name[64];         // function name when tool_choice == TOOL_NAMED
+    int want_audio;             // 1 if audio reply was requested (via modalities or audio)
+    int audio_pcm;              // 0 = wav (default), 1 = pcm16 (raw 24 kHz s16le)
+    char audio_voice[16];       // "" / "auto" or language code ("en", "es", "pt", "ru", "it", "fr", "de")
     double temperature;         // default 0.7
     int max_tokens;             // default 512
     int stream;                 // 0 or 1
@@ -88,5 +127,14 @@ typedef struct {
 // Reads a chat.completions body. Returns 0 if valid (fills req; messages are pool nodes, each an object with role
 // and content), or -1 with the reason in err (a fixed string, for the 400 answer).
 int api_chat_parse(const char* body, size_t len, JNode* pool, int max, ChatRequest* req, const char** err);
+
+// Builds the Qwen3.5 system prompt with tool declarations (plus user_sys if non-empty).
+void api_system_tools(const JNode* pool, const ChatRequest* req, const char* user_sys, Sb* out);
+// Formats an assistant message's tool_calls array into Qwen3.5 <tool_call><function=...> tags. Returns count, or -1.
+int api_assistant_tool_calls(const JNode* pool, int msg, Sb* out);
+// Parses <tool_call> blocks from the model's reply. Text before the first <tool_call> goes to content_out; returns
+// the number of tool calls parsed into calls (up to max_calls).
+int api_parse_tool_calls(const JNode* pool, const ChatRequest* req, const char* text, size_t len, Sb* content_out,
+                         ApiToolCall* calls, int max_calls);
 
 #endif

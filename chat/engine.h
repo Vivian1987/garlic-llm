@@ -141,7 +141,8 @@ typedef struct {
     uint32_t n_layers, hidden, inter, n_heads, n_kv, head_dim, vocab, max_seq, eos, eos2;
     float eps, rope_theta;
     // Qwen3.5 (model.idx "PMQ5"): Gated DeltaNet shape, partial RoPE, which layers are full attention
-    int qwen35;
+    int qwen35, neo;
+    uint32_t pf_rows;
     uint32_t n_kh, n_vh, dk, dv, rope_dim, full_mask, im_start, im_end;
     uint32_t* layer_base;   // index in t[] of each layer's first tensor (attn_norm)
     int has_head;           // untied output head: the last tensor (Qwen3.5-9B), or the one before "ids"

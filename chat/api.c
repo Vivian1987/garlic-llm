@@ -64,6 +64,11 @@ int api_send(int fd, const char* p, size_t n) {
     return 0;
 }
 
+int api_client_gone(int fd) {
+    char c;
+    return sceNetRecv(fd, &c, 1, 0x02 /* MSG_PEEK */ | 0x80 /* MSG_DONTWAIT */) == 0;
+}
+
 static void reply(int fd, int status, const char* reason, const char* ctype, const char* body, size_t n) {
     char head[512];
     int h = snprintf(head, sizeof(head),
@@ -138,6 +143,7 @@ static void serve_chat(int fd, HttpRequest* req) {
     ChatRequest cr;
     const char* err = NULL;
     if (!pool || api_chat_parse(req->body, req->body_len, pool, API_MAX_NODES, &cr, &err)) {
+        say("api: 400 Bad Request (%s, %zu bytes)", err ? err : "Out of memory", req->body_len);
         free(pool);
         reply_json_error(fd, 400, "Bad Request", err ? err : "Out of memory.", "invalid_request_error", "invalid_body");
         return;
@@ -180,7 +186,7 @@ static void serve_chat(int fd, HttpRequest* req) {
 static void handle(int fd) {
     struct {
         long sec, usec;
-    } tmo = {20, 0};
+    } tmo = {60, 0};
     sceNetSetsockopt(fd, API_SOL_SOCKET, API_SO_RCVTIMEO, &tmo, sizeof(tmo));
     sceNetSetsockopt(fd, API_SOL_SOCKET, API_SO_SNDTIMEO, &tmo, sizeof(tmo));
     char* buf = NULL;
@@ -188,6 +194,7 @@ static void handle(int fd) {
     HttpRequest req;
     int r = read_request(fd, &buf, &len, &req);
     if (r != 1) {   // malformed, too big, or cut off before the end
+        say("api: incomplete or malformed HTTP request (r=%d, %zu bytes)", r, len);
         reply_json_error(fd, 400, "Bad Request", "Malformed or incomplete request.", "invalid_request_error", NULL);
         return;
     }
@@ -213,11 +220,13 @@ static void handle(int fd) {
         if (spec) reply(fd, 200, "OK", "application/json", (const char*)spec, n);
         else reply_json_error(fd, 404, "Not Found", "The API description is missing.", "invalid_request_error", NULL);
         free(spec);
-    } else if (!strcmp(req.method, "POST") && !strcmp(req.path, "/v1/chat/completions")) {
+    } else if (!strcmp(req.method, "POST") &&
+               (!strcmp(req.path, "/v1/chat/completions") || !strcmp(req.path, "/chat/completions"))) {
         serve_chat(fd, &req);
         free(buf);
         return;   // (serve_chat keeps the connection until the main loop has written the reply)
     } else {
+        say("api: 404 %s %s", req.method, req.path);
         reply_json_error(fd, 404, "Not Found", "No such endpoint.", "invalid_request_error", NULL);
     }
     free(buf);
@@ -306,7 +315,7 @@ static OrbisNetId api_listen(void) {
     a.family = ORBIS_NET_AF_INET;
     a.port = sceNetHtons(API_PORT);
     a.addr = 0;   // any address
-    if (sceNetBind(s, (const OrbisNetSockaddr*)&a, sizeof(a)) || sceNetListen(s, 4)) {
+    if (sceNetBind(s, (const OrbisNetSockaddr*)&a, sizeof(a)) || sceNetListen(s, 16)) {
         say("api: cannot listen on port %d; the API stays off", API_PORT);
         sceNetSocketClose(s);
         return -1;
@@ -346,19 +355,21 @@ int api_enable(int want) {
         if (!on) return 0;
         scePthreadMutexLock(&api_mu);
         OrbisNetId l = listen_fd;
+        listen_fd = -1;
         on = 0;
         scePthreadMutexUnlock(&api_mu);
-        // the server thread leaves its wait for a connection, and the port is closed (close_if_off)
-        if (l >= 0) sceNetSocketAbort(l, 0);
-        for (int i = 0; i < 40 && accepting; i++) sceKernelUsleep(5000);
-        close_if_off();
+        if (l >= 0) {
+            sceNetSocketAbort(l, 0);
+            for (int i = 0; i < 60 && accepting; i++) sceKernelUsleep(5000);
+            sceNetSocketClose(l);
+        }
         say("api: off");
         return 0;
     }
     if (on) return 0;
     if (api_setup()) return -1;
     scePthreadMutexLock(&api_mu);
-    int l = listen_fd;   // (still open only if the server thread has been waiting on it since the API went off)
+    int l = listen_fd;
     if (l < 0) l = listen_fd = api_listen();
     if (l >= 0) on = 1;
     scePthreadMutexUnlock(&api_mu);
